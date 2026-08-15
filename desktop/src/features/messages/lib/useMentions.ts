@@ -176,6 +176,29 @@ export function useMentions(
       ),
     [relayAgentsQuery.data],
   );
+  // Relay-directory agents whose declared owner is the current user are
+  // "managed remotely" — the user runs them on another machine, so they never
+  // appear in the local managed-agent registry. They must be offered by @
+  // autocomplete regardless of their `respondTo` allow-list policy. This set
+  // is derived strictly from the relay/agent directory: a profile-only agent
+  // identity (e.g. a kind-0 profile with isAgent but no kind:10100 directory
+  // record) never enters it, so `shouldHideAgentFromMentions` keeps hiding
+  // those.
+  const ownedRelayAgentPubkeys = React.useMemo(
+    () =>
+      new Set(
+        (relayAgentsQuery.data ?? []).flatMap((agent) => {
+          const pubkey = normalizePubkey(agent.pubkey);
+          const ownerPubkey = profiles?.[pubkey]?.ownerPubkey;
+          return ownerPubkey &&
+            currentPubkey &&
+            normalizePubkey(ownerPubkey) === normalizePubkey(currentPubkey)
+            ? [pubkey]
+            : [];
+        }),
+      ),
+    [currentPubkey, profiles, relayAgentsQuery.data],
+  );
   const sharedChannelIds = React.useMemo(
     () => getSharedChannelIds(channelsQuery.data),
     [channelsQuery.data],
@@ -193,11 +216,13 @@ export function useMentions(
         managedAgentPubkeys,
         relayAgents: relayAgentsQuery.data,
         sharedChannelIds,
+        ownedRelayAgentPubkeys,
       }),
     [
       currentPubkey,
       managedAgentPubkeys,
       mentionChannelId,
+      ownedRelayAgentPubkeys,
       relayAgentsQuery.data,
       sharedChannelIds,
     ],

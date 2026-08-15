@@ -281,12 +281,30 @@ export function MembersSidebar({
       ]),
     );
     const sharedChannelIds = getSharedChannelIds(channelsQuery.data);
+    // Relay-directory agents whose declared owner is the current user are
+    // remotely managed (hosted on another machine), so the same allow-list
+    // relaxation the composer applies must apply here: `isAgentIdentityInAllowedList`
+    // must not reject them. Derived from the relay/agent directory only, so
+    // profile-only identities (no directory record) stay hidden.
+    const memberProfiles = memberProfilesQuery.data?.profiles ?? {};
+    const ownedRelayAgentPubkeys = new Set(
+      (relayAgentsQuery.data ?? []).flatMap((agent) => {
+        const pubkey = normalizePubkey(agent.pubkey);
+        const ownerPubkey = memberProfiles[pubkey]?.ownerPubkey;
+        return ownerPubkey &&
+          currentPubkey &&
+          normalizePubkey(ownerPubkey) === normalizePubkey(currentPubkey)
+          ? [pubkey]
+          : [];
+      }),
+    );
     const allowedAgentPubkeys = getMentionableAgentPubkeys({
       currentPubkey,
       eligibilityScope: { type: "community" },
       managedAgentPubkeys: managedAgentsByPubkey.keys(),
       relayAgents: relayAgentsQuery.data,
       sharedChannelIds,
+      ownedRelayAgentPubkeys,
     });
 
     const addCandidate = (candidate: AddMemberSearchCandidate) => {
@@ -377,6 +395,7 @@ export function MembersSidebar({
     isArchivedDiscovery,
     currentPubkey,
     managedAgentsQuery.data,
+    memberProfilesQuery.data,
     memberPubkeys,
     normalizedDeferredSearchQuery,
     relayAgentsQuery.data,

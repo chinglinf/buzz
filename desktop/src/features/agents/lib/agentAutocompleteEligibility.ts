@@ -52,30 +52,51 @@ export function getMentionableAgentPubkeys({
   managedAgentPubkeys,
   relayAgents,
   sharedChannelIds,
+  ownedRelayAgentPubkeys,
 }: {
   currentPubkey?: string | null;
   eligibilityScope: AgentEligibilityScope;
   managedAgentPubkeys: Iterable<string>;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
+  /**
+   * Normalized pubkeys of relay-directory agents whose declared owner is the
+   * current user — i.e. agents the user manages but which are hosted on
+   * another machine (visible only through the relay/agent directory, never
+   * through the local managed-agent registry). These are mentionable
+   * regardless of their `respondTo` policy because the user is their owner;
+   * the allow-list gate must not reject them. Must be derived from
+   * `relayAgents` by the caller — a profile-only identity with no relay
+   * directory record must NOT be listed here, or it would be un-hidden.
+   */
+  ownedRelayAgentPubkeys?: ReadonlySet<string>;
 }) {
   const pubkeys = new Set(
     [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
   );
 
+  const ownedPubkeys = new Set(
+    [...(ownedRelayAgentPubkeys ?? [])].map((pubkey) =>
+      normalizePubkey(pubkey),
+    ),
+  );
+
   for (const agent of relayAgents ?? []) {
+    const normalized = normalizePubkey(agent.pubkey);
     const isAllowed =
       eligibilityScope.type === "managed-only"
         ? false
-        : eligibilityScope.type === "community"
-          ? relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)
-          : relayAgentCanRespondInChannel(
-              agent,
-              eligibilityScope.channelId,
-              currentPubkey,
-            );
+        : ownedPubkeys.has(normalized)
+          ? true
+          : eligibilityScope.type === "community"
+            ? relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)
+            : relayAgentCanRespondInChannel(
+                agent,
+                eligibilityScope.channelId,
+                currentPubkey,
+              );
     if (isAllowed) {
-      pubkeys.add(normalizePubkey(agent.pubkey));
+      pubkeys.add(normalized);
     }
   }
 

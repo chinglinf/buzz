@@ -203,6 +203,75 @@ test("getMentionableAgentPubkeys: scopes channel composers and fails closed with
   );
 });
 
+test("getMentionableAgentPubkeys: admits viewer-owned relay agents regardless of respondTo policy", () => {
+  const relayAgents = [
+    {
+      pubkey: PUB_B,
+      respondTo: "owner-only",
+      respondToAllowlist: [],
+      channelIds: ["other"],
+    },
+    {
+      pubkey: PUB_C,
+      respondTo: "owner-only",
+      respondToAllowlist: [],
+      channelIds: ["other"],
+    },
+  ];
+
+  // A remotely managed agent (owned by the viewer, present in the relay
+  // directory) is mentionable even though its owner-only policy would
+  // otherwise exclude it.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      eligibilityScope: { type: "community" },
+      managedAgentPubkeys: [],
+      currentPubkey: CURRENT_PUBKEY,
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+      ownedRelayAgentPubkeys: new Set([PUB_B]),
+    }),
+    new Set([PUB_B]),
+  );
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      eligibilityScope: { type: "channel", channelId: "general" },
+      managedAgentPubkeys: [],
+      currentPubkey: CURRENT_PUBKEY,
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+      ownedRelayAgentPubkeys: new Set([PUB_B]),
+    }),
+    new Set([PUB_B]),
+  );
+
+  // Managed-only contexts (DMs, unresolved composers) stay fail-closed for
+  // every relay agent, owned or not.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      eligibilityScope: { type: "managed-only" },
+      managedAgentPubkeys: [],
+      currentPubkey: CURRENT_PUBKEY,
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+      ownedRelayAgentPubkeys: new Set([PUB_B]),
+    }),
+    new Set(),
+  );
+
+  // Without the owned set the allow-list gate is unchanged: both stay hidden.
+  assert.deepEqual(
+    getMentionableAgentPubkeys({
+      eligibilityScope: { type: "community" },
+      managedAgentPubkeys: [],
+      currentPubkey: CURRENT_PUBKEY,
+      relayAgents,
+      sharedChannelIds: new Set(["general"]),
+    }),
+    new Set(),
+  );
+});
+
 test("autocomplete helper extraction preserves safe filtering and labels", () => {
   assert.equal(isAgentMentionChannelType("stream"), true);
   assert.equal(isAgentMentionChannelType("forum"), true);

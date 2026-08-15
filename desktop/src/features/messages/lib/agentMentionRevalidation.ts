@@ -50,12 +50,15 @@ export async function revalidateAgentMentionPubkeys({
     return [...pubkeys];
   }
 
+  // Owner profiles are needed for every send (not just owner-only builds):
+  // a relay-directory agent whose owner is the current user is a remotely
+  // managed agent, and its mention must survive revalidation even when its
+  // respondTo policy would otherwise exclude it. A failed fetch simply yields
+  // an empty owned set below and the allow-list gate applies as before.
   const [managedResult, relayResult, ownerProfiles] = await Promise.all([
     refetchManagedAgents(),
     refetchRelayAgents(),
-    ownerOnly
-      ? refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null)
-      : Promise.resolve(null),
+    refetchOwnerProfiles([...requestedAgentPubkeys]).catch(() => null),
   ]);
   if (
     managedResult.error !== null ||
@@ -72,12 +75,28 @@ export async function revalidateAgentMentionPubkeys({
   const managedPubkeys = new Set(
     managedResult.data.map((agent) => normalizePubkey(agent.pubkey)),
   );
+  // Same relaxation as the autocomplete surface: relay-directory agents whose
+  // declared owner is the current user are remotely managed, so their selected
+  // mention must not be stripped here. Profile-only identities absent from the
+  // relay directory cannot appear in this set.
+  const ownedRelayAgentPubkeys = new Set(
+    (relayResult.data ?? []).flatMap((agent) => {
+      const pubkey = normalizePubkey(agent.pubkey);
+      const ownerPubkey = ownerProfiles?.profiles[pubkey]?.ownerPubkey;
+      return ownerPubkey &&
+        currentPubkey &&
+        normalizePubkey(ownerPubkey) === normalizePubkey(currentPubkey)
+        ? [pubkey]
+        : [];
+    }),
+  );
   const mentionablePubkeys = getMentionableAgentPubkeys({
     currentPubkey,
     eligibilityScope,
     managedAgentPubkeys: managedPubkeys,
     relayAgents: relayResult.data,
     sharedChannelIds,
+    ownedRelayAgentPubkeys,
   });
   const admittedPubkeys = new Set(
     [...agentPubkeys].filter(
