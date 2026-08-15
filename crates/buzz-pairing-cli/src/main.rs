@@ -111,6 +111,12 @@ fn wait_secs(default: u64) -> Duration {
 
 #[tokio::main]
 async fn main() {
+    // rustls needs an explicit process-level CryptoProvider (see Cargo.toml):
+    // tokio-tungstenite's webpki-roots feature enables no provider by itself,
+    // so a scoped build panics on any wss:// connect. Same pattern as the
+    // main `buzz` CLI and `buzz-relay`. Ignore AlreadyInstalled errors.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     if let Err(e) = run(cli.command).await {
         eprintln!("error: {e}");
