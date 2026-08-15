@@ -431,6 +431,85 @@ fn build_profile_event(
         .map_err(|e| format!("failed to sign profile event: {e}"))
 }
 
+// ── Agent directory record builder ──────────────────────────────────────────
+
+/// Merge a fresh agent-directory payload onto the agent's prior kind:10100
+/// content map.
+///
+/// Pure function (no I/O) extracted from `sync_managed_agent_directory_record`
+/// so the merge semantics can be unit tested without HTTP calls.
+///
+/// kind:10100 is REPLACEABLE (10000–19999): publishing replaces the entire
+/// prior record. Other tools write policy keys into this same kind (e.g.
+/// `buzz channels set-agent-channel-add-policy` writes `channel_add_policy`),
+/// so this merge starts from `prior` and overwrites ONLY the eight known
+/// directory fields — any unrecognised key survives unchanged.
+fn build_agent_directory_content(
+    prior: serde_json::Map<String, serde_json::Value>,
+    name: &str,
+    respond_to: &str,
+    respond_to_allowlist: &[String],
+    channel_ids: &[String],
+    is_running: bool,
+) -> serde_json::Value {
+    let mut content = prior;
+    content.insert("name".to_string(), serde_json::json!(name));
+    content.insert("agent_type".to_string(), serde_json::json!("agent"));
+    content.insert("channels".to_string(), serde_json::json!([]));
+    content.insert("channel_ids".to_string(), serde_json::json!(channel_ids));
+    content.insert("capabilities".to_string(), serde_json::json!([]));
+    content.insert(
+        "status".to_string(),
+        serde_json::json!(if is_running { "online" } else { "offline" }),
+    );
+    content.insert("respond_to".to_string(), serde_json::json!(respond_to));
+    content.insert(
+        "respond_to_allowlist".to_string(),
+        serde_json::json!(respond_to_allowlist),
+    );
+    serde_json::Value::Object(content)
+}
+
+/// Build a signed kind:10100 agent-directory event for `agent_keys`.
+///
+/// Pure function (no I/O) extracted from `sync_managed_agent_directory_record`
+/// so the event construction and auth-tag injection can be unit tested without
+/// HTTP calls.
+///
+/// When a NIP-OA auth tag is present it is verified against the agent pubkey
+/// BEFORE it is injected into the event — an unverified tag must be rejected
+/// rather than published. Cross-version bridging (nostr 0.36 → 0.37) mirrors
+/// `build_profile_event`.
+fn build_agent_directory_event(
+    agent_keys: &nostr::Keys,
+    content: &str,
+    auth_tag_json: Option<&str>,
+) -> Result<nostr::Event, String> {
+    let builder = EventBuilder::new(
+        Kind::Custom(buzz_sdk_pkg::kind::KIND_AGENT_PROFILE as u16),
+        content,
+    );
+
+    let builder = if let Some(tag_json) = auth_tag_json {
+        let agent_pubkey_hex = agent_keys.public_key().to_hex();
+        let compat_pubkey = nostr::PublicKey::from_hex(&agent_pubkey_hex)
+            .map_err(|e| format!("failed to convert agent pubkey for auth verification: {e}"))?;
+        buzz_sdk_pkg::nip_oa::verify_auth_tag(tag_json, &compat_pubkey)
+            .map_err(|e| format!("auth tag verification failed for directory record: {e}"))?;
+        let compat_tag = buzz_sdk_pkg::nip_oa::parse_auth_tag(tag_json)
+            .map_err(|e| format!("failed to parse verified auth tag: {e}"))?;
+        let tag = Tag::parse(compat_tag.as_slice())
+            .map_err(|e| format!("failed to convert auth tag to nostr 0.37: {e}"))?;
+        builder.tags([tag])
+    } else {
+        builder
+    };
+
+    builder
+        .sign_with_keys(agent_keys)
+        .map_err(|e| format!("failed to sign agent-directory record: {e}"))
+}
+
 // ── Managed-agent profile sync ──────────────────────────────────────────────
 
 /// Sync a managed agent's kind:0 profile event to the relay using NIP-98 auth.
@@ -473,6 +552,105 @@ pub async fn sync_managed_agent_profile(
         let msg = relay_error_message(response).await;
         return Err(format!(
             "Could not sync the agent's profile metadata: {msg}"
+        ));
+    }
+
+    Ok(())
+}
+
+// ── Agent directory sync ────────────────────────────────────────────────────
+
+/// Publish a managed agent's kind:10100 agent-directory record to the relay.
+///
+/// The agent signs its own directory record and the NIP-98 HTTP-auth event, so
+/// no API token is required. The agent's existing kind:10100 record is read
+/// first and merged over — never clobbered — so unrelated keys such as
+/// `channel_add_policy` survive a publish.
+///
+/// Best-effort by contract: callers treat a failure here as "the agent is
+/// merely undiscoverable from other machines", never as a hard failure of the
+/// underlying operation.
+pub async fn sync_managed_agent_directory_record(
+    state: &AppState,
+    relay_url: &str,
+    agent_keys: &nostr::Keys,
+    name: &str,
+    respond_to: &str,
+    respond_to_allowlist: &[String],
+    channel_ids: &[String],
+    is_running: bool,
+    auth_tag: Option<&str>,
+) -> Result<(), String> {
+    let api_base = relay_http_base_url(relay_url);
+    let agent_pubkey = agent_keys.public_key().to_hex();
+
+    // Read the agent's prior kind:10100 record (if any) as the merge base.
+    // If this read fails, do NOT publish: publishing a fresh record on a
+    // failed read is exactly how the `channel_add_policy` field gets lost.
+    let prior_events = query_relay_at_with_keys(
+        state,
+        &api_base,
+        &[serde_json::json!({
+            "authors": [&agent_pubkey],
+            "kinds": [buzz_sdk_pkg::kind::KIND_AGENT_PROFILE],
+            "limit": 1,
+        })],
+        agent_keys,
+        auth_tag,
+    )
+    .await?;
+    let prior_map = prior_events
+        .first()
+        .and_then(|ev| serde_json::from_str::<serde_json::Value>(&ev.content).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+
+    // An empty `channel_ids` is the silent-failure mode of this whole task:
+    // the stock eligibility gate `relayAgentIsSharedWithUser` requires the
+    // agent's channel_ids to intersect the viewer's joined channels, so a
+    // record with an empty list makes `.some()` false and the agent stays
+    // invisible. Refuse to publish rather than fabricate discoverability.
+    if channel_ids.is_empty() {
+        return Err(format!(
+            "agent-directory sync: agent {agent_pubkey} has no channel memberships; \
+             refusing to publish an empty channel_ids record"
+        ));
+    }
+
+    let content = build_agent_directory_content(
+        prior_map,
+        name,
+        respond_to,
+        respond_to_allowlist,
+        channel_ids,
+        is_running,
+    );
+    let event = build_agent_directory_event(agent_keys, &content.to_string(), auth_tag)?;
+    let body_bytes = event.as_json().into_bytes();
+    crate::egress_guard::assert_no_key_backup_bytes(&body_bytes, "agent-directory record sync")?;
+
+    crate::relay_admission::wait_for_rate_limit().await;
+    let url = format!("{}/events", api_base);
+    let auth = build_nip98_auth_header_for_keys(agent_keys, &Method::POST, &url, &body_bytes)?;
+
+    let mut request = state
+        .http_client
+        .post(&url)
+        .header("Authorization", auth)
+        .header("Content-Type", "application/json");
+    if let Some(tag) = auth_tag {
+        request = request.header("x-auth-tag", tag);
+    }
+    let response = request
+        .body(body_bytes)
+        .send()
+        .await
+        .map_err(|e| classify_request_error(&e))?;
+
+    if !response.status().is_success() {
+        let msg = relay_error_message(response).await;
+        return Err(format!(
+            "Could not sync the agent's directory record: {msg}"
         ));
     }
 
@@ -606,9 +784,9 @@ pub async fn submit_signed_event_with_keys(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_profile_event, classify_intercepted_response, effective_agent_relay_url,
-        extract_retry_in_hint, parse_command_response, relay_http_base_url,
-        MALFORMED_RESPONSE_MESSAGE,
+        build_agent_directory_content, build_agent_directory_event, build_profile_event,
+        classify_intercepted_response, effective_agent_relay_url, extract_retry_in_hint,
+        parse_command_response, relay_http_base_url, MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
 
@@ -978,6 +1156,162 @@ mod tests {
         // Structurally valid JSON array but with a bogus signature — verification must fail.
         let bad_json = format!(r#"["auth","{}","","{}"]"#, "a".repeat(64), "b".repeat(128));
         let result = build_profile_event(&agent_keys, "TestBot", None, Some(&bad_json));
+        assert!(result.is_err(), "should reject an invalid auth tag");
+        assert!(
+            result.unwrap_err().contains("verification failed"),
+            "error message should mention verification failure"
+        );
+    }
+
+    // ── build_agent_directory_content / build_agent_directory_event ──────────
+
+    #[test]
+    fn directory_content_carries_all_eight_fields() {
+        let content = build_agent_directory_content(
+            serde_json::Map::new(),
+            "Scout",
+            "anyone",
+            &[],
+            &["chan-a".to_string(), "chan-b".to_string()],
+            true,
+        );
+        let obj = content.as_object().expect("content must be an object");
+        assert_eq!(obj["name"], serde_json::json!("Scout"));
+        assert_eq!(obj["agent_type"], serde_json::json!("agent"));
+        assert_eq!(obj["channels"], serde_json::json!([]));
+        assert_eq!(
+            obj["channel_ids"],
+            serde_json::json!(["chan-a", "chan-b"])
+        );
+        assert_eq!(obj["capabilities"], serde_json::json!([]));
+        assert_eq!(obj["status"], serde_json::json!("online"));
+        assert_eq!(obj["respond_to"], serde_json::json!("anyone"));
+        assert_eq!(obj["respond_to_allowlist"], serde_json::json!([]));
+        assert_eq!(obj.len(), 8, "exactly the eight directory fields");
+    }
+
+    #[test]
+    fn directory_content_preserves_unknown_prior_keys() {
+        let mut prior = serde_json::Map::new();
+        prior.insert(
+            "channel_add_policy".to_string(),
+            serde_json::json!("owner-only"),
+        );
+        let content = build_agent_directory_content(
+            prior,
+            "Scout",
+            "allowlist",
+            &["a".repeat(64)],
+            &["chan-a".to_string()],
+            false,
+        );
+        let obj = content.as_object().expect("content must be an object");
+        // The unrecognised policy key must survive the merge untouched.
+        assert_eq!(
+            obj["channel_add_policy"],
+            serde_json::json!("owner-only")
+        );
+        assert_eq!(obj["respond_to"], serde_json::json!("allowlist"));
+        assert_eq!(
+            obj["respond_to_allowlist"],
+            serde_json::json!(["a".repeat(64)])
+        );
+        assert_eq!(obj["status"], serde_json::json!("offline"));
+        assert_eq!(obj.len(), 9, "8 directory fields + surviving policy key");
+    }
+
+    #[test]
+    fn directory_content_overwrites_known_prior_field() {
+        let mut prior = serde_json::Map::new();
+        prior.insert("status".to_string(), serde_json::json!("online"));
+        prior.insert("name".to_string(), serde_json::json!("OldName"));
+        let content = build_agent_directory_content(
+            prior,
+            "NewName",
+            "owner-only",
+            &[],
+            &["chan-a".to_string()],
+            false,
+        );
+        let obj = content.as_object().expect("content must be an object");
+        assert_eq!(obj["name"], serde_json::json!("NewName"));
+        assert_eq!(obj["status"], serde_json::json!("offline"));
+        assert_eq!(obj["respond_to"], serde_json::json!("owner-only"));
+    }
+
+    #[test]
+    fn directory_content_empty_prior_is_complete_object() {
+        let content = build_agent_directory_content(
+            serde_json::Map::new(),
+            "Scout",
+            "anyone",
+            &[],
+            &["chan-a".to_string()],
+            true,
+        );
+        let obj = content.as_object().expect("content must be an object");
+        assert_eq!(obj.len(), 8);
+        for key in [
+            "name",
+            "agent_type",
+            "channels",
+            "channel_ids",
+            "capabilities",
+            "status",
+            "respond_to",
+            "respond_to_allowlist",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+    }
+
+    #[test]
+    fn directory_event_is_kind_10100_signed_by_agent() {
+        let agent_keys = nostr::Keys::generate();
+        let content = r#"{"name":"Scout","agent_type":"agent","channels":[],"channel_ids":["chan-a"],"capabilities":[],"status":"online","respond_to":"anyone","respond_to_allowlist":[]}"#;
+        let event = build_agent_directory_event(&agent_keys, content, None)
+            .expect("should build without an auth tag");
+
+        assert_eq!(
+            event.kind,
+            nostr::Kind::Custom(buzz_sdk_pkg::kind::KIND_AGENT_PROFILE as u16)
+        );
+        assert_eq!(event.pubkey, agent_keys.public_key());
+        let parsed: serde_json::Value =
+            serde_json::from_str(&event.content).expect("content must be valid JSON");
+        assert_eq!(parsed["channel_ids"][0], serde_json::json!("chan-a"));
+    }
+
+    #[test]
+    fn directory_event_with_valid_auth_tag() {
+        let agent_keys = nostr::Keys::generate();
+        let tag_json = make_valid_auth_tag(&agent_keys);
+        let event = build_agent_directory_event(
+            &agent_keys,
+            r#"{"name":"Scout","channel_ids":["chan-a"]}"#,
+            Some(&tag_json),
+        )
+        .expect("should succeed with a valid auth tag");
+
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
+            .collect();
+        assert_eq!(auth_tags.len(), 1, "expected exactly 1 auth tag");
+        assert_eq!(
+            event.kind,
+            nostr::Kind::Custom(buzz_sdk_pkg::kind::KIND_AGENT_PROFILE as u16)
+        );
+    }
+
+    #[test]
+    fn directory_event_rejects_invalid_auth_tag() {
+        let agent_keys = nostr::Keys::generate();
+        // Structurally valid JSON array but with a bogus signature — verification must fail.
+        let bad_json = format!(r#"["auth","{}","","{}"]"#, "a".repeat(64), "b".repeat(128));
+        let result =
+            build_agent_directory_event(&agent_keys, r#"{"name":"Scout"}"#, Some(&bad_json));
         assert!(result.is_err(), "should reject an invalid auth tag");
         assert!(
             result.unwrap_err().contains("verification failed"),
