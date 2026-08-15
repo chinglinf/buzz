@@ -115,6 +115,35 @@ async fn boundary_sync_managed_agent_profile_blocks_ncryptsec() {
     assert_guard_error(&err);
 }
 
+/// Boundary 2b: `relay.rs` `sync_managed_agent_directory_record` (agent
+/// kind:10100 directory record).
+///
+/// Unlike boundary 2, this one cannot be driven through its async entry point
+/// here. `sync_managed_agent_directory_record` must read the agent's prior
+/// kind:10100 record and its channel memberships from the relay *before* it can
+/// build a body at all — `channel_ids` comes from that second query — so against
+/// a dead relay it fails with a query error and never reaches the guard. The
+/// injection is therefore applied to the exact payload the boundary emits: the
+/// signed event built by the same pure builders the sync function calls, passed
+/// to the same guard.
+#[test]
+fn boundary_agent_directory_record_blocks_ncryptsec() {
+    let keys = nostr::Keys::generate();
+    let content = crate::relay::build_agent_directory_content(
+        serde_json::Map::new(),
+        &format!("agent {NCRYPTSEC}"),
+        "anyone",
+        &[],
+        &["ef113a94-d50d-5a0a-8d9b-b4b58d9d0b62".to_string()],
+        false,
+    );
+    let event = crate::relay::build_agent_directory_event(&keys, &content.to_string(), None)
+        .expect("event should build");
+    let body_bytes = nostr::JsonUtil::as_json(&event).into_bytes();
+    let err = assert_no_key_backup_bytes(&body_bytes, "agent-directory record sync").unwrap_err();
+    assert_guard_error(&err);
+}
+
 /// Boundary 3: `relay/submit.rs` `submit_signed_event_at_with_keys` — the
 /// pre-signed entry into the boundary-1 funnel (main's submit refactor
 /// replaced `relay.rs` `submit_signed_event` with this scoped form).
@@ -262,7 +291,7 @@ fn src_rust_files() -> Vec<std::path::PathBuf> {
 /// guard + adding an injection test for the new site.
 const EVENTS_INVENTORY: &[(&str, usize, usize)] = &[
     // Production egress boundaries (see egress_guard.rs table):
-    ("src/relay.rs", 2, 2),                             // boundaries 2, 4
+    ("src/relay.rs", 3, 3),                             // boundaries 2, 2b, 4
     ("src/relay/submit.rs", 1, 1),                      // boundaries 1 + 3 (shared funnel)
     ("src/huddle/pipeline.rs", 1, 1),                   // boundary 5
     ("src/commands/team_snapshot.rs", 1, 1),            // boundary 6

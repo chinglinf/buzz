@@ -444,7 +444,7 @@ fn build_profile_event(
 /// `buzz channels set-agent-channel-add-policy` writes `channel_add_policy`),
 /// so this merge starts from `prior` and overwrites ONLY the eight known
 /// directory fields — any unrecognised key survives unchanged.
-fn build_agent_directory_content(
+pub(crate) fn build_agent_directory_content(
     prior: serde_json::Map<String, serde_json::Value>,
     name: &str,
     respond_to: &str,
@@ -480,7 +480,7 @@ fn build_agent_directory_content(
 /// BEFORE it is injected into the event — an unverified tag must be rejected
 /// rather than published. Cross-version bridging (nostr 0.36 → 0.37) mirrors
 /// `build_profile_event`.
-fn build_agent_directory_event(
+pub(crate) fn build_agent_directory_event(
     agent_keys: &nostr::Keys,
     content: &str,
     auth_tag_json: Option<&str>,
@@ -1208,10 +1208,7 @@ mod tests {
         assert_eq!(obj["name"], serde_json::json!("Scout"));
         assert_eq!(obj["agent_type"], serde_json::json!("agent"));
         assert_eq!(obj["channels"], serde_json::json!([]));
-        assert_eq!(
-            obj["channel_ids"],
-            serde_json::json!(["chan-a", "chan-b"])
-        );
+        assert_eq!(obj["channel_ids"], serde_json::json!(["chan-a", "chan-b"]));
         assert_eq!(obj["capabilities"], serde_json::json!([]));
         assert_eq!(obj["status"], serde_json::json!("online"));
         assert_eq!(obj["respond_to"], serde_json::json!("anyone"));
@@ -1236,10 +1233,7 @@ mod tests {
         );
         let obj = content.as_object().expect("content must be an object");
         // The unrecognised policy key must survive the merge untouched.
-        assert_eq!(
-            obj["channel_add_policy"],
-            serde_json::json!("owner-only")
-        );
+        assert_eq!(obj["channel_add_policy"], serde_json::json!("owner-only"));
         assert_eq!(obj["respond_to"], serde_json::json!("allowlist"));
         assert_eq!(
             obj["respond_to_allowlist"],

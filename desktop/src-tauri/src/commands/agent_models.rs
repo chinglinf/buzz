@@ -26,8 +26,7 @@ use crate::{
         DEFAULT_ACP_COMMAND,
     },
     relay::{
-        relay_ws_url_with_override, sync_managed_agent_directory_record,
-        sync_managed_agent_profile,
+        relay_ws_url_with_override, sync_managed_agent_directory_record, sync_managed_agent_profile,
     },
     util::now_iso,
 };

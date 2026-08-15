@@ -17,8 +17,7 @@ use crate::{
         DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
     relay::{
-        relay_ws_url_with_override, sync_managed_agent_directory_record,
-        sync_managed_agent_profile,
+        relay_ws_url_with_override, sync_managed_agent_directory_record, sync_managed_agent_profile,
     },
     util::now_iso,
 };
