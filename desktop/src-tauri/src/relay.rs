@@ -563,9 +563,12 @@ pub async fn sync_managed_agent_profile(
 /// Publish a managed agent's kind:10100 agent-directory record to the relay.
 ///
 /// The agent signs its own directory record and the NIP-98 HTTP-auth event, so
-/// no API token is required. The agent's existing kind:10100 record is read
-/// first and merged over — never clobbered — so unrelated keys such as
-/// `channel_add_policy` survive a publish.
+/// no API token is required. `channel_ids` is sourced from the agent's real
+/// channel memberships, queried from the relay with the agent's own keys (the
+/// same kind:39002 `#p` membership query the desktop uses for the user's own
+/// channels, scoped to the agent pubkey). The agent's existing kind:10100
+/// record is read first and merged over — never clobbered — so unrelated keys
+/// such as `channel_add_policy` survive a publish.
 ///
 /// Best-effort by contract: callers treat a failure here as "the agent is
 /// merely undiscoverable from other machines", never as a hard failure of the
@@ -577,7 +580,6 @@ pub async fn sync_managed_agent_directory_record(
     name: &str,
     respond_to: &str,
     respond_to_allowlist: &[String],
-    channel_ids: &[String],
     is_running: bool,
     auth_tag: Option<&str>,
 ) -> Result<(), String> {
@@ -605,6 +607,33 @@ pub async fn sync_managed_agent_directory_record(
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default();
 
+    // Source `channel_ids` from the agent's real memberships. kind:39002 is
+    // addressable (d-tag = channel id) and lists members as `p` tags, so the
+    // `#p` filter returns exactly the channels the agent belongs to.
+    let member_events = query_relay_at_with_keys(
+        state,
+        &api_base,
+        &[serde_json::json!({
+            "kinds": [buzz_sdk_pkg::kind::KIND_NIP29_GROUP_MEMBERS],
+            "#p": [&agent_pubkey],
+            "limit": 1000,
+        })],
+        agent_keys,
+        auth_tag,
+    )
+    .await?;
+    let mut channel_ids: Vec<String> = member_events
+        .iter()
+        .filter_map(|ev| {
+            ev.tags.iter().find_map(|t| {
+                let s = t.as_slice();
+                (s.len() >= 2 && s[0] == "d").then(|| s[1].clone())
+            })
+        })
+        .collect();
+    channel_ids.sort();
+    channel_ids.dedup();
+
     // An empty `channel_ids` is the silent-failure mode of this whole task:
     // the stock eligibility gate `relayAgentIsSharedWithUser` requires the
     // agent's channel_ids to intersect the viewer's joined channels, so a
@@ -622,7 +651,7 @@ pub async fn sync_managed_agent_directory_record(
         name,
         respond_to,
         respond_to_allowlist,
-        channel_ids,
+        &channel_ids,
         is_running,
     );
     let event = build_agent_directory_event(agent_keys, &content.to_string(), auth_tag)?;
