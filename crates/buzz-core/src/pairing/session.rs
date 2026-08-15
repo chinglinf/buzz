@@ -525,6 +525,13 @@ impl PairingSession {
             relays: self.relay_urls.clone(),
         }))
     }
+
+    /// Override the session timeout (how long the session stays valid from
+    /// creation). Defaults to [`DEFAULT_TIMEOUT`] (120 s). Useful for pairing
+    /// sessions that may legitimately stay idle longer than the default.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
+    }
 }
 
 #[cfg(test)]
@@ -535,11 +542,6 @@ impl PairingSession {
     /// `processed_ids` through the public API.
     fn has_processed(&self, event: &Event) -> bool {
         self.processed_ids.contains(&event.id.to_bytes())
-    }
-
-    /// Override the session timeout for testing.
-    fn set_timeout(&mut self, timeout: Duration) {
-        self.timeout = timeout;
     }
 }
 

@@ -109,6 +109,19 @@ fn wait_secs(default: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Session lifetime in seconds before the pairing session is considered
+/// expired (NIP-AB default 120 s). Overridable via `BUZZ_PAIR_SESSION_TIMEOUT_SECS`
+/// so a source can legitimately stay idle longer than 120 s before the target
+/// submits its offer. Missing/invalid/zero values fall back to the default.
+fn session_timeout() -> Duration {
+    let secs = std::env::var("BUZZ_PAIR_SESSION_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(120);
+    Duration::from_secs(secs)
+}
+
 #[tokio::main]
 async fn main() {
     // rustls needs an explicit process-level CryptoProvider (see Cargo.toml):
@@ -138,6 +151,7 @@ async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliEr
 
     // Create pairing session.
     let (mut session, qr) = PairingSession::new_source(relay_url.clone());
+    session.set_timeout(session_timeout());
     let qr_uri = encode_qr(&qr);
 
     println!("QR URI (contains session secret — do not share beyond the target device):");
@@ -246,6 +260,7 @@ async fn cmd_target(relay_override: Option<String>, show_secret: bool) -> Result
 
     // Create target session + offer event.
     let (mut session, offer_event) = PairingSession::new_target(&qr)?;
+    session.set_timeout(session_timeout());
 
     // Connect to relay and handle NIP-42 auth if required.
     let (ws, _) = connect_async(&relay_url).await?;
