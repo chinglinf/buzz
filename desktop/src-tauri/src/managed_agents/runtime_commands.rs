@@ -446,6 +446,22 @@ fn unkeyable_failed_status(
     }
 }
 
+/// Which managed-agent records get a kind:10100 directory publish at launch.
+///
+/// Deliberately NOT gated on `start_on_app_launch` (unlike the reconcile
+/// `jobs` list): discoverability must not depend on whether an agent
+/// auto-starts — an agent that is merely *present* and in a channel should be
+/// mentionable from another machine. Provider agents are excluded because
+/// their keys are not ours to sign with.
+fn directory_publish_candidates(
+    records: &[super::ManagedAgentRecord],
+) -> Vec<&super::ManagedAgentRecord> {
+    records
+        .iter()
+        .filter(|record| record.backend == BackendKind::Local)
+        .collect()
+}
+
 /// Spawn a lazy harness pair for every eligible (agent, community) pair.
 ///
 /// Eligibility is deliberately gated on `start_on_app_launch`: auto-start is
@@ -465,7 +481,9 @@ pub async fn reconcile_managed_agent_runtimes(
 
     let records = load_managed_agents(&app)?;
     let mut jobs = Vec::new();
-    for community in communities {
+    // Iterate by reference: `communities` is reused below for the directory
+    // publish fan-out.
+    for community in &communities {
         for record in records
             .iter()
             .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
@@ -494,8 +512,11 @@ pub async fn reconcile_managed_agent_runtimes(
     // start_pair does blocking work (std mutexes, process spawn, receipt
     // writes, and up-to-2s exit polling in terminate_untracked_pair_runtime),
     // so run the post-probe start loop off the async workers, matching the
-    // restart flows.
-    tokio::task::spawn_blocking(move || {
+    // restart flows. The directory publish below needs `app` afterward, so the
+    // blocking closure takes a clone rather than moving the handle.
+    let app_for_spawn = app.clone();
+    let statuses = tokio::task::spawn_blocking(move || {
+        let app = app_for_spawn;
         let personas = load_personas(&app).unwrap_or_default();
         let global = load_global_agent_config(&app).unwrap_or_default();
         let mut rows = Vec::new();
@@ -565,7 +586,87 @@ pub async fn reconcile_managed_agent_runtimes(
         rows
     })
     .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?;
+
+    // ── Agent-directory (kind:10100) publish at launch ─────────────────────
+    // Best-effort backfill, once per (record, community) pair. `create` fires
+    // before any channel membership exists (so its publish is refused as
+    // empty) and existing agents never re-run create, so without this pass a
+    // local agent's directory record would appear only after a rename or a
+    // model change. This pass also picks up channel joins since the last
+    // launch. Every failure is logged and skipped — a directory-sync failure
+    // must never change the reconcile's return value nor abort the remaining
+    // agents. In particular, the "no channel memberships" refusal is expected
+    // for an agent that is in no channel yet.
+    let state = app.state::<AppState>();
+    // The `!Send` std MutexGuard must be scoped to this block so it is provably
+    // dead before the publish stream below awaits.
+    let directory_jobs = {
+        let mut runtimes_guard = state.managed_agent_processes.lock().ok();
+        let mut jobs = Vec::new();
+        for community in &communities {
+            for record in directory_publish_candidates(&records) {
+                let relay_url = crate::relay::effective_agent_relay_url(
+                    &record.relay_url,
+                    &community.relay_url,
+                );
+                // Mirror the summary's running detection for local agents: a live
+                // pair on the effective relay, else the persisted pid.
+                let running = match runtimes_guard.as_mut() {
+                    Some(runtimes) => {
+                        ManagedAgentRuntimeKey::new(record.pubkey.clone(), &relay_url)
+                            .ok()
+                            .and_then(|key| runtimes.get_mut(&key))
+                            .map(|runtime| runtime.child.try_wait().ok().flatten().is_none())
+                            .unwrap_or(false)
+                    }
+                    None => false,
+                } || record.runtime_pid.map_or(false, process_is_running);
+                jobs.push((record.clone(), relay_url, running));
+            }
+        }
+        jobs
+    };
+
+    let _publishes: Vec<()> = stream::iter(directory_jobs)
+        .map(|(record, relay_url, running)| {
+            let state = app.state::<AppState>();
+            async move {
+                let agent_keys = match nostr::Keys::parse(record.private_key_nsec.trim()) {
+                    Ok(keys) => keys,
+                    Err(error) => {
+                        eprintln!(
+                            "agent-directory sync skipped for {}: invalid key: {error}",
+                            record.name
+                        );
+                        return;
+                    }
+                };
+                let respond_to = record.respond_to.as_str();
+                if let Err(directory_error) = crate::relay::sync_managed_agent_directory_record(
+                    &state,
+                    &relay_url,
+                    &agent_keys,
+                    &record.name,
+                    respond_to,
+                    &record.respond_to_allowlist,
+                    running,
+                    record.auth_tag.as_deref(),
+                )
+                .await
+                {
+                    eprintln!(
+                        "agent-directory sync failed for {}: {directory_error}",
+                        record.name
+                    );
+                }
+            }
+        })
+        .buffer_unordered(6)
+        .collect()
+        .await;
+
+    Ok(statuses)
 }
 
 #[cfg(test)]
@@ -712,5 +813,56 @@ mod tests {
             Some("unexpected"),
         );
         assert!(observer_lifecycle_key(&ready_with_error.pubkey, &ready_with_error).is_err());
+    }
+
+    fn directory_fixture(
+        hex_byte: &str,
+        name: &str,
+        start_on_app_launch: bool,
+        backend: &str,
+    ) -> super::super::ManagedAgentRecord {
+        serde_json::from_str(&format!(
+            r#"{{
+                "pubkey": "{}",
+                "name": "{name}",
+                "relay_url": "",
+                "acp_command": "buzz-acp",
+                "agent_command": "goose",
+                "agent_args": [],
+                "mcp_command": "",
+                "turn_timeout_seconds": 320,
+                "system_prompt": "",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "start_on_app_launch": {start_on_app_launch},
+                "backend": {backend}
+            }}"#,
+            hex_byte.repeat(32)
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn directory_publish_candidates_selects_local_agents_regardless_of_autostart() {
+        // The whole point of not reusing the reconcile `jobs` list (which is
+        // gated on start_on_app_launch): a present-but-manual-start local
+        // agent must still get its directory record published, so it stays
+        // mentionable from another machine.
+        let manual_local = directory_fixture("aa", "manual-local", false, r#"{"type": "local"}"#);
+        let auto_local = directory_fixture("bb", "auto-local", true, r#"{"type": "local"}"#);
+        let provider = directory_fixture(
+            "cc",
+            "provider",
+            true,
+            r#"{"type": "provider", "id": "p", "config": {}}"#,
+        );
+
+        let records = [manual_local.clone(), auto_local.clone(), provider.clone()];
+        let selected = directory_publish_candidates(&records);
+        let selected_pubkeys: Vec<&str> = selected.iter().map(|r| r.pubkey.as_str()).collect();
+
+        assert!(selected_pubkeys.contains(&manual_local.pubkey.as_str()));
+        assert!(selected_pubkeys.contains(&auto_local.pubkey.as_str()));
+        assert!(!selected_pubkeys.contains(&provider.pubkey.as_str()));
     }
 }
