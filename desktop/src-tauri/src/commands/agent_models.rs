@@ -25,7 +25,10 @@ use crate::{
         AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
         DEFAULT_ACP_COMMAND,
     },
-    relay::{relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{
+        relay_ws_url_with_override, sync_managed_agent_directory_record,
+        sync_managed_agent_profile,
+    },
     util::now_iso,
 };
 
@@ -900,6 +903,25 @@ pub async fn update_managed_agent(
             return Err(format!(
                 "Agent rename failed because its relay profile could not be updated. No changes were saved: {sync_error}"
             ));
+        }
+
+        // Directory record (kind:10100) sync — best-effort and independent of
+        // the profile rename: a failure here means the agent is merely
+        // undiscoverable from other machines, and must NOT roll back the model
+        // change.
+        if let Err(directory_error) = sync_managed_agent_directory_record(
+            &state,
+            &relay_url,
+            &agent_keys,
+            &display_name,
+            summary.respond_to.as_str(),
+            &summary.respond_to_allowlist,
+            summary.status == "running",
+            auth_tag.as_deref(),
+        )
+        .await
+        {
+            eprintln!("agent-directory sync failed for {display_name}: {directory_error}");
         }
     }
 

@@ -16,7 +16,10 @@ use crate::{
         ManagedAgentSummary, RelayMeshConfig, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_PARALLELISM,
         DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
     },
-    relay::{relay_ws_url_with_override, sync_managed_agent_profile},
+    relay::{
+        relay_ws_url_with_override, sync_managed_agent_directory_record,
+        sync_managed_agent_profile,
+    },
     util::now_iso,
 };
 
@@ -989,6 +992,25 @@ pub async fn create_managed_agent(
     )
     .await)
         .err();
+
+    // Directory record (kind:10100) sync — best-effort, like the profile sync:
+    // a failure here means the agent is merely undiscoverable from other
+    // machines, and must NOT abort agent creation.
+    let directory_sync_error = (sync_managed_agent_directory_record(
+        &state,
+        &profile_relay_url,
+        &agent_keys,
+        &name,
+        agent.respond_to.as_str(),
+        &agent.respond_to_allowlist,
+        agent.status == "running",
+        auth_tag.as_deref(),
+    )
+    .await)
+        .err();
+    if let Some(ref error) = directory_sync_error {
+        eprintln!("agent-directory sync failed for {name}: {error}");
+    }
 
     // ── Phase 5: provider deploy (async, outside lock) ───────────────────────
     let spawn_error = if input.spawn_after_create && input.backend != BackendKind::Local {
