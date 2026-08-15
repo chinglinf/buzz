@@ -20,7 +20,10 @@
 //! - **Signature verification** — Schnorr signatures are verified against the
 //!   NIP-01 event ID hash. Events with invalid signatures are rejected.
 //! - **No persistence** — events exist only in-flight between matched pub/sub.
-//! - **Bounded resources** — 128 max WS connections, 4 KiB max frame, 120s TTL.
+//! - **Bounded resources** — 128 max WS connections, 4 KiB max frame,
+//!   configurable per-connection lifetime (default 120 s).
+//! - **Keepalive** — server-initiated RFC 6455 Ping frames keep subscribed
+//!   idle connections alive through proxies/tunnels (default every 20 s).
 //! - **Session cap** — at most 6 accepted EVENTs per connection.
 //! - **Freshness** — `created_at` must be within ±120 s of relay wall-clock.
 //! - **Deduplication** — duplicate event IDs are rejected; dedup entries expire after 300 s.
@@ -55,8 +58,74 @@ use tokio_tungstenite::tungstenite::protocol::{Message, Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 use tokio_util::sync::CancellationToken;
 
-/// Hard per-connection lifetime. `pub(crate)` for test access.
-pub(crate) const CONN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default per-connection lifetime in seconds.
+pub const DEFAULT_CONN_TIMEOUT_SECS: u64 = 120;
+/// Default interval in seconds between server-initiated keepalive Ping frames.
+pub const DEFAULT_PING_INTERVAL_SECS: u64 = 20;
+
+/// Environment variable overriding the per-connection lifetime.
+pub const ENV_CONN_TIMEOUT_SECS: &str = "BUZZ_PAIR_RELAY_CONN_TIMEOUT_SECS";
+/// Environment variable overriding the keepalive Ping interval.
+pub const ENV_PING_INTERVAL_SECS: &str = "BUZZ_PAIR_RELAY_PING_INTERVAL_SECS";
+
+/// Runtime configuration for relay connections.
+///
+/// Both values are configurable via environment variables with sensible
+/// defaults; missing, invalid, and zero inputs fall back to the default.
+#[derive(Debug, Clone, Copy)]
+pub struct RelayConfig {
+    /// Maximum per-connection lifetime. Defaults to [`DEFAULT_CONN_TIMEOUT_SECS`].
+    pub conn_timeout: Duration,
+    /// Interval between server-initiated keepalive Ping frames. `None` disables.
+    pub ping_interval: Option<Duration>,
+}
+
+impl Default for RelayConfig {
+    fn default() -> Self {
+        Self {
+            conn_timeout: Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS),
+            ping_interval: Some(Duration::from_secs(DEFAULT_PING_INTERVAL_SECS)),
+        }
+    }
+}
+
+impl RelayConfig {
+    /// Build a config from the process environment, falling back to defaults.
+    pub fn from_env() -> Self {
+        Self::from_env_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// Pure form of [`RelayConfig::from_env`] for testability: `lookup(name)`
+    /// returns the raw env value; missing/invalid/zero inputs fall back to the
+    /// default.
+    pub(crate) fn from_env_lookup<F>(lookup: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self {
+            conn_timeout: Duration::from_secs(parse_secs_env(
+                lookup(ENV_CONN_TIMEOUT_SECS).as_deref(),
+                DEFAULT_CONN_TIMEOUT_SECS,
+            )),
+            ping_interval: Some(Duration::from_secs(parse_secs_env(
+                lookup(ENV_PING_INTERVAL_SECS).as_deref(),
+                DEFAULT_PING_INTERVAL_SECS,
+            ))),
+        }
+    }
+}
+
+/// Parse a positive whole-second value from an env var. Missing, non-numeric,
+/// and zero values fall back to `default`.
+fn parse_secs_env(raw: Option<&str>, default: u64) -> u64 {
+    match raw {
+        Some(raw) => match raw.trim().parse::<u64>() {
+            Ok(n) if n > 0 => n,
+            _ => default,
+        },
+        None => default,
+    }
+}
 
 const MAX_CONNS: u32 = 128;
 const CHANNEL_CAP: usize = 4;
@@ -91,6 +160,8 @@ const FRESHNESS_SECS: i64 = 120;
 enum OutMsg {
     Text(String),
     Pong(Vec<u8>),
+    /// Server-initiated keepalive Ping frame (RFC 6455).
+    Ping(Vec<u8>),
     Close,
 }
 
@@ -109,6 +180,10 @@ pub struct Relay {
     seen_ids: Mutex<Vec<([u8; 32], tokio::time::Instant)>>,
     /// Per-#p delivery counter — entries expire after ENTRY_TTL; rejects at DELIVERED_MAP_CAP after eviction.
     delivered: Mutex<HashMap<[u8; 32], (u32, tokio::time::Instant)>>,
+    /// Maximum per-connection lifetime (config-driven).
+    conn_timeout: Duration,
+    /// Keepalive ping interval; `None` disables server-initiated pings.
+    ping_interval: Option<Duration>,
 }
 
 impl Default for Relay {
@@ -118,13 +193,21 @@ impl Default for Relay {
 }
 
 impl Relay {
+    /// Relay configured from the process environment (falls back to defaults).
     pub fn new() -> Self {
+        Self::with_config(RelayConfig::from_env())
+    }
+
+    /// Relay with an explicit configuration (used by tests and embedding).
+    pub fn with_config(config: RelayConfig) -> Self {
         Self {
             subs: Mutex::new(Vec::new()),
             conn_count: AtomicU32::new(0),
             next_conn_id: AtomicU64::new(0),
             seen_ids: Mutex::new(Vec::new()),
             delivered: Mutex::new(HashMap::new()),
+            conn_timeout: config.conn_timeout,
+            ping_interval: config.ping_interval,
         }
     }
 
@@ -603,6 +686,7 @@ async fn writer_task(mut sink: WsSink, mut rx: mpsc::Receiver<OutMsg>, cancel: C
         let ws_msg = match msg {
             OutMsg::Text(s) => Message::Text(s.into()),
             OutMsg::Pong(d) => Message::Pong(d.into()),
+            OutMsg::Ping(d) => Message::Ping(d.into()),
             OutMsg::Close => Message::Close(None),
         };
         let result = tokio::select! {
@@ -633,13 +717,39 @@ async fn handle_conn(relay: Arc<Relay>, conn_id: u64, stream: WebSocketStream<To
     let mut sub_id: Option<String> = None;
     // Tightening #1: hard session cap — counts all valid+sig-verified EVENT attempts.
     let mut events_attempted: u32 = 0;
-    let deadline = tokio::time::sleep(CONN_TIMEOUT);
+    let deadline = tokio::time::sleep(relay.conn_timeout);
     tokio::pin!(deadline);
+
+    // Server-initiated keepalive Ping (RFC 6455). Sends a Ping frame every
+    // `ping_interval` so idle connections that hold a subscription stay alive
+    // through proxies/tunnels (e.g. Cloudflare's ~100 s quiet window). When
+    // pings are disabled the timer is set far in the future (100 years — never
+    // elapses in practice, and avoids `Instant` overflow) so the branch stays
+    // inert. The deadline and the ping timer are independent select branches,
+    // so pings can never starve the connection deadline.
+    let ping_interval = relay.ping_interval;
+    const PING_NEVER: Duration = Duration::from_secs(86400 * 365 * 100);
+    let ping_timer = tokio::time::sleep(ping_interval.unwrap_or(PING_NEVER));
+    tokio::pin!(ping_timer);
 
     'conn: loop {
         let frame = tokio::select! {
             _ = &mut deadline => break 'conn,
             _ = &mut writer_handle => break 'conn,  // writer died → close
+            _ = &mut ping_timer => {
+                // Keepalive tick. Only ping connections holding a subscription
+                // (an active pairing session); a bare connection rides the
+                // deadline. If the writer channel is full, skip this tick —
+                // the deadline still bounds the connection, and a full channel
+                // means the peer is not keeping up anyway.
+                if sub_id.is_some() {
+                    let _ = tx.try_send(OutMsg::Ping(Vec::new()));
+                }
+                ping_timer
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + ping_interval.unwrap_or(PING_NEVER));
+                continue;
+            }
             f = source.next() => match f { Some(f) => f, None => break 'conn },
         };
 
@@ -1021,5 +1131,62 @@ pub async fn run_server(listener: TcpListener, relay: Arc<Relay>) {
                 eprintln!("http error: {e}");
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_secs_env_defaults() {
+        // Missing -> default.
+        assert_eq!(parse_secs_env(None, 120), 120);
+        // Valid -> value.
+        assert_eq!(parse_secs_env(Some("300"), 120), 300);
+        assert_eq!(parse_secs_env(Some("  40 "), 120), 40);
+        // Zero / negative / non-numeric / empty -> default.
+        assert_eq!(parse_secs_env(Some("0"), 120), 120);
+        assert_eq!(parse_secs_env(Some("-1"), 120), 120);
+        assert_eq!(parse_secs_env(Some("abc"), 120), 120);
+        assert_eq!(parse_secs_env(Some(""), 120), 120);
+    }
+
+    #[test]
+    fn relay_config_from_env_lookup() {
+        // No env -> exact defaults (120 s timeout, 20 s ping).
+        let c = RelayConfig::from_env_lookup(|_| None);
+        assert_eq!(
+            c.conn_timeout,
+            Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            c.ping_interval,
+            Some(Duration::from_secs(DEFAULT_PING_INTERVAL_SECS))
+        );
+
+        // Valid overrides.
+        let c = RelayConfig::from_env_lookup(|name| match name {
+            ENV_CONN_TIMEOUT_SECS => Some("600".to_string()),
+            ENV_PING_INTERVAL_SECS => Some("5".to_string()),
+            _ => None,
+        });
+        assert_eq!(c.conn_timeout, Duration::from_secs(600));
+        assert_eq!(c.ping_interval, Some(Duration::from_secs(5)));
+
+        // Zero / invalid overrides fall back to defaults.
+        let c = RelayConfig::from_env_lookup(|name| match name {
+            ENV_CONN_TIMEOUT_SECS => Some("0".to_string()),
+            ENV_PING_INTERVAL_SECS => Some("junk".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            c.conn_timeout,
+            Duration::from_secs(DEFAULT_CONN_TIMEOUT_SECS)
+        );
+        assert_eq!(
+            c.ping_interval,
+            Some(Duration::from_secs(DEFAULT_PING_INTERVAL_SECS))
+        );
     }
 }

@@ -1,7 +1,9 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use buzz_pair_relay::{run_server, Relay};
+use buzz_pair_relay::{
+    run_server, Relay, RelayConfig, ENV_CONN_TIMEOUT_SECS, ENV_PING_INTERVAL_SECS,
+};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -22,6 +24,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let relay = Arc::new(Relay::new());
+    let config = RelayConfig::from_env();
+    eprintln!(
+        "buzz-pair-relay config: conn_timeout={:?} ping_interval={:?} \
+         (override via {ENV_CONN_TIMEOUT_SECS} / {ENV_PING_INTERVAL_SECS})",
+        config.conn_timeout, config.ping_interval
+    );
+    let relay = Arc::new(Relay::with_config(config));
     run_server(listener, relay).await;
 }

@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use buzz_pair_relay::{run_server, Relay};
+use buzz_pair_relay::{run_server, Relay, RelayConfig};
 
 use secp256k1::{Keypair, Secp256k1, SecretKey};
 use sha2::{Digest, Sha256};
@@ -1389,5 +1389,93 @@ async fn test_event_tag_string_too_long() {
         resp[3].as_str().unwrap_or("").contains("exactly one p tag"),
         "unexpected message: {}",
         resp[3]
+    );
+}
+
+/// 52. Configurable connection timeout: a shorter configured timeout closes the
+///     connection sooner than the 120 s default.
+#[tokio::test]
+async fn test_conn_timeout_configurable_shorter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = Arc::new(Relay::with_config(RelayConfig {
+        conn_timeout: Duration::from_secs(1),
+        ..Default::default()
+    }));
+    tokio::spawn(run_server(listener, relay));
+    let url = format!("ws://127.0.0.1:{}", addr.port());
+
+    let mut ws = connect(&url).await;
+    // Real time: wait past the configured 1 s deadline. The connection must be
+    // closed — a hard-coded 120 s timeout would still be open.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_closed(&mut ws).await;
+}
+
+/// 53. Configurable connection timeout: a longer configured timeout keeps the
+///     connection (and its subscription) open while keepalive pings flow —
+///     no early close, so the 120 s default is not hard-coded.
+#[tokio::test]
+async fn test_conn_timeout_longer_keeps_open() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = Arc::new(Relay::with_config(RelayConfig {
+        conn_timeout: Duration::from_secs(30),
+        ping_interval: Some(Duration::from_millis(500)),
+    }));
+    tokio::spawn(run_server(listener, relay));
+    let url = format!("ws://127.0.0.1:{}", addr.port());
+
+    let mut ws = connect(&url).await;
+    subscribe(&mut ws, "s1", P_A).await;
+
+    // Receive several server keepalive pings over ~1.5 s of real time: the
+    // subscribed connection must stay alive (and pinged) rather than closing.
+    for _ in 0..3 {
+        let msg = tokio::time::timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("no keepalive ping")
+            .expect("stream ended")
+            .expect("WebSocket error");
+        assert!(
+            matches!(msg, Message::Ping(_)),
+            "connection closed or sent an unexpected frame: {msg:?}"
+        );
+    }
+
+    // The connection is still usable after the pings: CLOSE the current
+    // subscription (one sub per connection), then re-REQ and get an EOSE.
+    send(&mut ws, &json!(["CLOSE", "s1"])).await;
+    send(&mut ws, &json!(["REQ", "chk", {"#p": [P_A]}])).await;
+    let eose = recv(&mut ws).await;
+    assert_eq!(eose[0], "EOSE");
+}
+
+/// 54. Server-initiated keepalive Ping: with a short configured ping interval,
+///     a subscribed connection receives an RFC 6455 Ping frame from the server.
+#[tokio::test]
+async fn test_server_keepalive_ping() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let relay = Arc::new(Relay::with_config(RelayConfig {
+        ping_interval: Some(Duration::from_secs(1)),
+        ..Default::default()
+    }));
+    tokio::spawn(run_server(listener, relay));
+    let url = format!("ws://127.0.0.1:{}", addr.port());
+
+    let mut ws = connect(&url).await;
+    // Subscribe so the keepalive applies (pings are for active sessions).
+    subscribe(&mut ws, "s1", P_A).await;
+
+    // The server should send a Ping frame within ~3 s of real time.
+    let msg = tokio::time::timeout(Duration::from_secs(3), ws.next())
+        .await
+        .expect("no server Ping within 3 s")
+        .expect("stream ended")
+        .expect("WebSocket error");
+    assert!(
+        matches!(msg, Message::Ping(_)),
+        "expected server Ping, got {msg:?}"
     );
 }

@@ -94,6 +94,21 @@ enum CliError {
     Other(String),
 }
 
+/// Wall-clock timeout for a `wait_for_event` step, in seconds.
+///
+/// Overridable via `BUZZ_PAIR_WAIT_SECS` so an operator can lengthen the
+/// client-side wait beyond the 120 s default (e.g. pairing sessions that may
+/// stay idle longer than the relay's historical cap). Missing, invalid, and
+/// zero values fall back to the per-call default.
+fn wait_secs(default: u64) -> Duration {
+    let secs = std::env::var("BUZZ_PAIR_WAIT_SECS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(default);
+    Duration::from_secs(secs)
+}
+
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -146,7 +161,7 @@ async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliEr
 
     // Wait for a valid offer event (silently discard junk per NIP-AB §Event Validation).
     let sas = loop {
-        let event = wait_for_event(&mut read, "pair", Duration::from_secs(120)).await?;
+        let event = wait_for_event(&mut read, "pair", wait_secs(120)).await?;
         check_for_abort(&mut session, &event)?;
         match session.handle_offer(&event) {
             Ok(sas) => break sas,
@@ -181,7 +196,7 @@ async fn cmd_source(relay_url: String, nsec: Option<String>) -> Result<(), CliEr
     // Wait for a valid complete event (skip junk; exit on peer abort).
     // Surface complete(success=false) explicitly instead of swallowing it.
     loop {
-        let event = wait_for_event(&mut read, "pair", Duration::from_secs(60)).await?;
+        let event = wait_for_event(&mut read, "pair", wait_secs(60)).await?;
         check_for_abort(&mut session, &event)?;
         match session.handle_complete(&event) {
             Ok(()) => break,
@@ -264,7 +279,7 @@ async fn cmd_target(relay_override: Option<String>, show_secret: bool) -> Result
     // TranscriptMismatch is a hard security failure (possible MITM) —
     // surface it immediately rather than swallowing it in the generic handler.
     loop {
-        let event = wait_for_event(&mut read, "pair", Duration::from_secs(120)).await?;
+        let event = wait_for_event(&mut read, "pair", wait_secs(120)).await?;
         check_for_abort(&mut session, &event)?;
         match session.handle_sas_confirm(&event) {
             Ok(_) => break,
@@ -302,7 +317,7 @@ async fn cmd_target(relay_override: Option<String>, show_secret: bool) -> Result
 
     // Wait for a valid payload event (silently discard junk; exit on peer abort).
     let (payload_type, payload) = loop {
-        let event = wait_for_event(&mut read, "pair", Duration::from_secs(60)).await?;
+        let event = wait_for_event(&mut read, "pair", wait_secs(60)).await?;
         check_for_abort(&mut session, &event)?;
         match session.handle_payload(&event) {
             Ok(result) => break result,
