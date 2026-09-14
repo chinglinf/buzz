@@ -49,11 +49,34 @@ pub(super) fn requirements(
             let augmented_path = cli_probe::augmented_path();
             match cli_probe::login_probe(&binary_path, probe_args, augmented_path.as_deref()) {
                 cli_probe::ProbeOutcome::LoggedIn => vec![],
-                cli_probe::ProbeOutcome::LoggedOut => vec![missing_requirement(
-                    probe_args,
-                    setup_copy,
-                    AcpAvailabilityStatus::Available,
-                )],
+                cli_probe::ProbeOutcome::LoggedOut => {
+                    // Durable fallback for claude (addresses GUI-launched env/Keychain/PATH gaps
+                    // between the readiness probe and the actual ACP consumer). If the credentials
+                    // file contains a non-empty accessToken, treat as ready so the normal pool
+                    // starts. Turns will surface real auth failures if the token is invalid.
+                    // This is the least-invasive correction for the probe-vs-consumer mismatch.
+                    if runtime.id == "claude" {
+                        if let Ok(home) = std::env::var("HOME") {
+                            let cred_path = std::path::Path::new(&home)
+                                .join(".claude")
+                                .join(".credentials.json");
+                            if let Ok(content) = std::fs::read_to_string(&cred_path) {
+                                if content.contains("\"accessToken\"")
+                                    && content.contains("\"accessToken\":\"")
+                                    && !content.contains("\"accessToken\":\"\"")
+                                    && !content.contains("\"accessToken\":null")
+                                {
+                                    return vec![];
+                                }
+                            }
+                        }
+                    }
+                    vec![missing_requirement(
+                        probe_args,
+                        setup_copy,
+                        AcpAvailabilityStatus::Available,
+                    )]
+                }
                 cli_probe::ProbeOutcome::ConfigInvalid { stderr_excerpt } => {
                     vec![Requirement::CliConfigInvalid {
                         probe_args: probe_args.iter().map(|value| value.to_string()).collect(),
